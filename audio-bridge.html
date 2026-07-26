@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>DopePod audio</title>
+		<style>
+			html,
+			body {
+				margin: 0;
+				padding: 0;
+				background: transparent;
+				overflow: hidden;
+			}
+		</style>
+	</head>
+	<body>
+		<script>
+			/*
+			 * The microphone and the speaker.
+			 *
+			 * This page exists for one reason: iOS will not give a React Native app
+			 * a stream of raw microphone samples without native code, and native
+			 * code cannot run in Expo Go. A WebView can — `getUserMedia` works
+			 * inside Expo Go because Expo Go's own binary carries the microphone
+			 * permission string and implements WKWebView's capture delegate.
+			 *
+			 * It must be loaded from an https:// origin. WKWebView does not treat
+			 * string-injected HTML, file:// URLs, or even http://localhost as a
+			 * secure context, and outside a secure context `navigator.mediaDevices`
+			 * is simply undefined. That is the whole reason this file is hosted
+			 * rather than bundled.
+			 *
+			 * It holds no keys, talks to no server, and knows nothing about Gemini.
+			 * Audio goes up to React Native as base64 and comes back the same way.
+			 * The socket lives in the app, where the code is testable.
+			 */
+
+			// What the API expects from us, and what it sends back. Neither is
+			// negotiable, and neither will be the hardware's own rate, so both
+			// directions get resampled below.
+			var CAPTURE_RATE = 16000;
+			var PLAYBACK_RATE = 24000;
+
+			// 4096 frames is ~85ms at 48kHz. Small enough to feel live, large
+			// enough that we are not crossing the React Native bridge constantly.
+			var FRAMES = 4096;
+
+			// How far ahead of the clock playback is scheduled. Web Audio will not
+			// start a buffer in the past, so a little slack absorbs the jitter of
+			// packets arriving over a mobile connection.
+			var LEAD = 0.12;
+
+			var ctx = null;
+			var stream = null;
+			var source = null;
+			var processor = null;
+			var gain = null;
+
+			/** Where the next chunk of the model's voice should begin playing. */
+			var nextPlayAt = 0;
+			/** Everything scheduled but not yet heard, so it can be cut short. */
+			var scheduled = [];
+
+			/** Leftover input samples between resampler runs, to avoid clicks. */
+			var carry = new Float32Array(0);
+
+			function post(message) {
+				var target = window.ReactNativeWebView;
+				if (target && target.postMessage) {
+					target.postMessage(JSON.stringify(message));
+				}
+			}
+
+			function fail(stage, error) {
+				post({
+					type: "error",
+					stage: stage,
+					message: (error && (error.message || error.name)) || String(error),
+				});
+			}
+
+			// -----------------------------------------------------------------
+			// Capture
+			// -----------------------------------------------------------------
+
+			/**
+			 * Resample to 16kHz.
+			 *
+			 * The hardware decides the context's rate — 48000 on most iPhones,
+			 * sometimes 44100 — so the ratio is rarely a whole number and simple
+			 * decimation would alias badly. Averaging every source sample that
+			 * falls inside an output sample's span is a crude box filter, which is
+			 * cheap, runs in the audio callback without dropping frames, and is
+			 * more than enough for speech.
+			 */
+			function downsample(input, fromRate) {
+				if (fromRate === CAPTURE_RATE) return input;
+
+				var joined;
+				if (carry.length > 0) {
+					joined = new Float32Array(carry.length + input.length);
+					joined.set(carry, 0);
+					joined.set(input, carry.length);
+				} else {
+					joined = input;
+				}
+
+				var ratio = fromRate / CAPTURE_RATE;
+				var count = Math.floor(joined.length / ratio);
+				var out = new Float32Array(count);
+
+				for (var i = 0; i < count; i++) {
+					var start = Math.floor(i * ratio);
+					var end = Math.floor((i + 1) * ratio);
+					if (end > joined.length) end = joined.length;
+					var sum = 0;
+					var n = 0;
+					for (var j = start; j < end; j++) {
+						sum += joined[j];
+						n++;
+					}
+					out[i] = n > 0 ? sum / n : 0;
+				}
+
+				// Keep whatever did not fill a whole output sample; dropping it is
+				// what produces the periodic tick you hear in naive resamplers.
+				var consumed = Math.floor(count * ratio);
+				carry = joined.subarray(consumed);
+				return out;
+			}
+
+			/** Float [-1,1] to signed 16-bit little-endian, base64. */
+			function encode(samples) {
+				var bytes = new Uint8Array(samples.length * 2);
+				var view = new DataView(bytes.buffer);
+				for (var i = 0; i < samples.length; i++) {
+					var s = samples[i];
+					if (s > 1) s = 1;
+					else if (s < -1) s = -1;
+					view.setInt16(i * 2, Math.round(s * 32767), true);
+				}
+
+				// btoa over a 8KB string built one character at a time is slow
+				// enough to matter ten times a second; chunked String.fromCharCode
+				// is roughly an order of magnitude faster.
+				var binary = "";
+				var step = 0x8000;
+				for (var k = 0; k < bytes.length; k += step) {
+					binary += String.fromCharCode.apply(
+						null,
+						bytes.subarray(k, k + step),
+					);
+				}
+				return btoa(binary);
+			}
+
+			function levelOf(samples) {
+				var sum = 0;
+				for (var i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
+				return Math.sqrt(sum / Math.max(1, samples.length));
+			}
+
+			async function start() {
+				try {
+					if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+						// The signature of a non-secure context. Worth naming exactly,
+						// because every other symptom of it looks like a dead mic.
+						post({
+							type: "error",
+							stage: "insecure",
+							message:
+								"This page is not running in a secure context, so the " +
+								"microphone is unavailable. It must be served over https.",
+						});
+						return;
+					}
+
+					// The context is created before getUserMedia on purpose: it is
+					// what makes iOS negotiate a play-and-record audio session, so
+					// the model's voice and the microphone can be live at once.
+					if (!ctx) {
+						var Ctor = window.AudioContext || window.webkitAudioContext;
+						ctx = new Ctor();
+						gain = ctx.createGain();
+						gain.connect(ctx.destination);
+					}
+					if (ctx.state === "suspended") await ctx.resume();
+
+					stream = await navigator.mediaDevices.getUserMedia({
+						audio: {
+							channelCount: 1,
+							// Without cancellation the model hears itself through the
+							// speaker and interrupts its own sentences.
+							echoCancellation: true,
+							noiseSuppression: true,
+							autoGainControl: true,
+						},
+						video: false,
+					});
+
+					source = ctx.createMediaStreamSource(stream);
+
+					// ScriptProcessorNode is deprecated in favour of AudioWorklet.
+					// It is used anyway: AudioWorklet needs a separately fetched
+					// module URL, and in WKWebView it fails silently often enough
+					// that a deprecated node which always works is the better
+					// engineering choice.
+					processor = ctx.createScriptProcessor(FRAMES, 1, 1);
+					processor.onaudioprocess = function (event) {
+						var input = event.inputBuffer.getChannelData(0);
+						var samples = downsample(input, ctx.sampleRate);
+						if (samples.length === 0) return;
+						post({
+							type: "chunk",
+							data: encode(samples),
+							level: levelOf(samples),
+						});
+					};
+
+					source.connect(processor);
+					// Safari will not run a ScriptProcessorNode that is not connected
+					// to the destination. Routing it through a silent gain node keeps
+					// it alive without echoing the microphone into the earpiece.
+					var mute = ctx.createGain();
+					mute.gain.value = 0;
+					processor.connect(mute);
+					mute.connect(ctx.destination);
+
+					nextPlayAt = 0;
+					post({ type: "ready", sampleRate: ctx.sampleRate });
+				} catch (error) {
+					fail("start", error);
+				}
+			}
+
+			function stop() {
+				try {
+					if (processor) {
+						processor.onaudioprocess = null;
+						processor.disconnect();
+						processor = null;
+					}
+					if (source) {
+						source.disconnect();
+						source = null;
+					}
+					if (stream) {
+						stream.getTracks().forEach(function (track) {
+							track.stop();
+						});
+						stream = null;
+					}
+					flush();
+					carry = new Float32Array(0);
+					post({ type: "stopped" });
+				} catch (error) {
+					fail("stop", error);
+				}
+			}
+
+			// -----------------------------------------------------------------
+			// Playback
+			// -----------------------------------------------------------------
+
+			/**
+			 * Queue a chunk of the model's voice.
+			 *
+			 * Chunks arrive faster than real time and must be played back to back
+			 * with no gap, so each one is scheduled at the exact moment the last
+			 * one ends rather than "now". A gap of even a few milliseconds between
+			 * buffers is audible as a click in the middle of a word.
+			 */
+			function play(base64) {
+				try {
+					if (!ctx) return;
+					if (ctx.state === "suspended") ctx.resume();
+
+					var binary = atob(base64);
+					var count = binary.length >> 1;
+					if (count === 0) return;
+
+					var buffer = ctx.createBuffer(1, count, PLAYBACK_RATE);
+					var channel = buffer.getChannelData(0);
+					for (var i = 0; i < count; i++) {
+						var lo = binary.charCodeAt(i * 2);
+						var hi = binary.charCodeAt(i * 2 + 1);
+						var value = (hi << 8) | lo;
+						if (value >= 0x8000) value -= 0x10000;
+						channel[i] = value / 32768;
+					}
+
+					var node = ctx.createBufferSource();
+					node.buffer = buffer;
+					node.connect(gain);
+
+					var now = ctx.currentTime;
+					if (nextPlayAt < now + 0.01) nextPlayAt = now + LEAD;
+					node.start(nextPlayAt);
+					nextPlayAt += buffer.duration;
+
+					scheduled.push(node);
+					node.onended = function () {
+						var at = scheduled.indexOf(node);
+						if (at >= 0) scheduled.splice(at, 1);
+					};
+				} catch (error) {
+					fail("play", error);
+				}
+			}
+
+			/** Cut playback short. Called when the person talks over the model. */
+			function flush() {
+				for (var i = 0; i < scheduled.length; i++) {
+					try {
+						scheduled[i].onended = null;
+						scheduled[i].stop();
+					} catch (error) {
+						// Already finished between the interrupt and this call.
+					}
+				}
+				scheduled = [];
+				nextPlayAt = 0;
+			}
+
+			// -----------------------------------------------------------------
+			// Bridge
+			// -----------------------------------------------------------------
+
+			window.dopepod = { start: start, stop: stop, play: play, flush: flush };
+
+			function receive(event) {
+				var command;
+				try {
+					command = JSON.parse(event.data);
+				} catch (error) {
+					return;
+				}
+				if (command.type === "start") void start();
+				else if (command.type === "stop") stop();
+				else if (command.type === "play") play(command.data);
+				else if (command.type === "flush") flush();
+			}
+
+			// iOS delivers injected messages on `window`; Android on `document`.
+			// Listening to both is cheaper than branching on platform.
+			window.addEventListener("message", receive);
+			document.addEventListener("message", receive);
+
+			post({ type: "loaded", secure: window.isSecureContext === true });
+		</script>
+	</body>
+</html>
