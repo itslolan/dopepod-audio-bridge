@@ -47,9 +47,14 @@
 			var FRAMES = 4096;
 
 			// How far ahead of the clock playback is scheduled. Web Audio will not
-			// start a buffer in the past, so a little slack absorbs the jitter of
-			// packets arriving over a mobile connection.
-			var LEAD = 0.12;
+			// start a buffer in the past, so this slack absorbs the jitter of
+			// packets arriving over a mobile connection AND crossing the
+			// React Native <-> WebView bridge. Set deliberately high: on a flaky
+			// car network the old 120ms drained faster than packets refilled it,
+			// so playback kept starving and re-anchoring — heard as constant
+			// choppy drop-outs. A quarter-second cushion costs a touch of latency
+			// to first audio but rides out the gaps instead of stuttering.
+			var LEAD = 0.25;
 
 			var ctx = null;
 			var stream = null;
