@@ -56,6 +56,29 @@
 			// to first audio but rides out the gaps instead of stuttering.
 			var LEAD = 0.25;
 
+			// Silence gating. The microphone runs continuously, but there is no
+			// reason to upload raw PCM (~340 kbps once base64'd) while the person
+			// is silent and only listening — which is exactly when the model's
+			// own voice is streaming down and needs the connection. Gemini uses
+			// WebSocket (TCP), so a congested uplink stalls the downlink and the
+			// reply turns choppy. So mic chunks below a loudness threshold are
+			// not sent at all. A ring of recent chunks is kept as pre-roll so the
+			// first word after silence is not clipped, and sending continues for
+			// a hangover window after the voice drops so the server still sees
+			// the trailing silence it needs to decide the turn is over (the
+			// hangover is deliberately longer than the server's silenceDurationMs
+			// of 800ms).
+			var SPEECH_LEVEL = 0.02;
+			var HANGOVER_MS = 1200;
+			var PREROLL = 3;
+
+			/** True while mic chunks are being uploaded (person is speaking). */
+			var sending = false;
+			/** Timestamp of the last chunk loud enough to count as speech. */
+			var lastLoud = 0;
+			/** Recent silent chunks, kept so a speech onset is not clipped. */
+			var preroll = [];
+
 			var ctx = null;
 			var stream = null;
 			var source = null;
@@ -216,11 +239,39 @@
 						var input = event.inputBuffer.getChannelData(0);
 						var samples = downsample(input, ctx.sampleRate);
 						if (samples.length === 0) return;
-						post({
-							type: "chunk",
-							data: encode(samples),
-							level: levelOf(samples),
-						});
+
+						var level = levelOf(samples);
+						var now = Date.now();
+
+						if (level >= SPEECH_LEVEL) {
+							lastLoud = now;
+							if (!sending) {
+								// Voice just started: flush the buffered pre-roll so
+								// the first syllable is not lost, then switch on.
+								sending = true;
+								for (var p = 0; p < preroll.length; p++) {
+									post({ type: "chunk", data: encode(preroll[p]) });
+								}
+								preroll = [];
+							}
+						} else if (sending && now - lastLoud > HANGOVER_MS) {
+							// Enough trailing silence has been sent for the server to
+							// finalise the turn; stop uploading until the next word.
+							sending = false;
+						}
+
+						if (sending) {
+							post({ type: "chunk", data: encode(samples), level: level });
+						} else {
+							// Keep the meter alive without shipping the audio, and
+							// remember a little history in case speech resumes.
+							post({ type: "chunk", level: level });
+							// A copy: when the device already runs at 16kHz,
+							// downsample returns the live input buffer, which the
+							// next callback overwrites before the pre-roll is used.
+							preroll.push(new Float32Array(samples));
+							if (preroll.length > PREROLL) preroll.shift();
+						}
 					};
 
 					source.connect(processor);
@@ -233,6 +284,9 @@
 					mute.connect(ctx.destination);
 
 					nextPlayAt = 0;
+					sending = false;
+					lastLoud = 0;
+					preroll = [];
 					post({ type: "ready", sampleRate: ctx.sampleRate });
 				} catch (error) {
 					fail("start", error);
