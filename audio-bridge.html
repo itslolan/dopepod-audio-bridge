@@ -72,12 +72,25 @@
 			var HANGOVER_MS = 1200;
 			var PREROLL = 3;
 
+			// Warm-up window. A freshly opened microphone is cold: the browser's
+			// automatic gain control starts near unity and takes a second or two
+			// to find the speaker, so the very first thing said — the "hi" that
+			// opens the call — is often captured too quiet to clear SPEECH_LEVEL
+			// and is never uploaded. The person says "hi", hears nothing, says
+			// "hi" again, and only the second one lands. So for a short window
+			// after capture begins, audio is sent unconditionally, VAD gate or
+			// not, and the server's own VAD decides where the turn is. After it
+			// closes, normal silence gating resumes.
+			var WARMUP_MS = 2500;
+
 			/** True while mic chunks are being uploaded (person is speaking). */
 			var sending = false;
 			/** Timestamp of the last chunk loud enough to count as speech. */
 			var lastLoud = 0;
 			/** Recent silent chunks, kept so a speech onset is not clipped. */
 			var preroll = [];
+			/** While Date.now() is below this, upload every chunk regardless of level. */
+			var warmUntil = 0;
 
 			var ctx = null;
 			var stream = null;
@@ -243,6 +256,12 @@
 						var level = levelOf(samples);
 						var now = Date.now();
 
+						// During the warm-up window the gate is held open: the mic's
+						// gain is still settling, so trusting the level here is how
+						// the first word gets dropped. Send everything and let the
+						// server decide the turn.
+						var warming = now < warmUntil;
+
 						if (level >= SPEECH_LEVEL) {
 							lastLoud = now;
 							if (!sending) {
@@ -254,13 +273,13 @@
 								}
 								preroll = [];
 							}
-						} else if (sending && now - lastLoud > HANGOVER_MS) {
+						} else if (sending && !warming && now - lastLoud > HANGOVER_MS) {
 							// Enough trailing silence has been sent for the server to
 							// finalise the turn; stop uploading until the next word.
 							sending = false;
 						}
 
-						if (sending) {
+						if (sending || warming) {
 							post({ type: "chunk", data: encode(samples), level: level });
 						} else {
 							// Keep the meter alive without shipping the audio, and
@@ -287,6 +306,9 @@
 					sending = false;
 					lastLoud = 0;
 					preroll = [];
+					// Open the gate for the first couple of seconds so a cold mic
+					// cannot swallow the opening word.
+					warmUntil = Date.now() + WARMUP_MS;
 					post({ type: "ready", sampleRate: ctx.sampleRate });
 				} catch (error) {
 					fail("start", error);
